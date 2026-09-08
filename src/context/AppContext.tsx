@@ -16,6 +16,21 @@ import {
   INITIAL_SETTINGS,
   INITIAL_USERS
 } from '../data/initialData';
+import {
+  saveOrderToFirestore,
+  updateOrderInFirestore,
+  deleteOrderFromFirestore,
+  subscribeToOrders,
+  saveServiceToFirestore,
+  deleteServiceFromFirestore,
+  subscribeToServices,
+  saveSettingsToFirestore,
+  subscribeToSettings,
+  firebaseSignIn,
+  firebaseSignUp,
+  firebaseSignOut,
+  isAdminEmail
+} from '../services/firebaseService';
 
 export interface ToastMessage {
   id: string;
@@ -42,9 +57,9 @@ interface AppContextType {
   removeToast: (id: string) => void;
   
   // Auth
-  login: (email: string, pass: string) => Promise<boolean>;
+  login: (email: string, pass: string) => Promise<UserProfile>;
   loginWithDemo: (role: 'customer' | 'admin') => void;
-  register: (name: string, email: string, mobile: string, pass: string) => Promise<boolean>;
+  register: (nameOrData: string | { name: string; email: string; mobile: string; password?: string }, email?: string, mobile?: string, pass?: string) => Promise<UserProfile>;
   logout: () => void;
   
   // Orders
@@ -188,6 +203,42 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return () => window.removeEventListener('hashchange', handleHash);
   }, []);
 
+  // Sync real-time data from Firebase Firestore
+  useEffect(() => {
+    const unsubOrders = subscribeToOrders((remoteOrders) => {
+      if (remoteOrders && remoteOrders.length > 0) {
+        setOrders(prev => {
+          const map = new Map<string, OrderItem>();
+          // Remote first
+          remoteOrders.forEach(o => map.set(o.orderId, o));
+          // Keep local if not yet in remote
+          prev.forEach(o => {
+            if (!map.has(o.orderId)) map.set(o.orderId, o);
+          });
+          return Array.from(map.values());
+        });
+      }
+    });
+
+    const unsubServices = subscribeToServices((remoteServices) => {
+      if (remoteServices && remoteServices.length > 0) {
+        setServices(remoteServices);
+      }
+    });
+
+    const unsubSettings = subscribeToSettings((remoteSettings) => {
+      if (remoteSettings) {
+        setSettings(prev => ({ ...prev, ...remoteSettings }));
+      }
+    });
+
+    return () => {
+      unsubOrders();
+      unsubServices();
+      unsubSettings();
+    };
+  }, []);
+
   // Save to localStorage
   useEffect(() => {
     try {
@@ -272,55 +323,39 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   // Auth functions
-  const login = async (email: string, pass: string): Promise<boolean> => {
-    const matched = customers.find(c => c.email.toLowerCase() === email.trim().toLowerCase());
-    if (matched) {
-      if (matched.status === 'blocked') {
-        showToast('Your account is blocked. Please contact support.', 'error');
-        return false;
-      }
-      setCurrentUser(matched);
-      showToast(`Welcome back, ${matched.name}!`, 'success');
-      return true;
+  const login = async (email: string, pass: string): Promise<UserProfile> => {
+    try {
+      // Authenticate via Firebase Auth
+      const userProfile = await firebaseSignIn(email, pass);
+      setCurrentUser(userProfile);
+      setCustomers(prev => {
+        const exists = prev.some(c => c.email.toLowerCase() === userProfile.email.toLowerCase());
+        if (exists) {
+          return prev.map(c => c.email.toLowerCase() === userProfile.email.toLowerCase() ? userProfile : c);
+        }
+        return [userProfile, ...prev];
+      });
+      showToast(`Welcome back, ${userProfile.name}!`, 'success');
+      return userProfile;
+    } catch (err: any) {
+      showToast(err?.message || 'Login failed', 'error');
+      throw err;
     }
-    // Check if email contains admin
-    if (email.toLowerCase().includes('admin') || email.toLowerCase() === 'rejaasif50@gmail.com') {
-      const adminUser: UserProfile = {
-        uid: 'admin_reza_' + Date.now(),
-        name: 'Administrator',
-        email: email.trim(),
+  };
+
+  const loginWithDemo = (role: 'customer' | 'admin') => {
+    if (role === 'admin') {
+      const admin: UserProfile = {
+        uid: 'admin_reza_primary',
+        name: 'Reza Administrator',
+        email: 'admin@rezaenterprise.com',
         mobile: '+91 9876543210',
         role: 'admin',
         status: 'active',
         createdAt: new Date().toISOString()
       };
-      setCurrentUser(adminUser);
-      setCustomers(prev => [...prev, adminUser]);
-      showToast('Admin logged in successfully', 'success');
-      return true;
-    }
-
-    // Standard new user login
-    const newUser: UserProfile = {
-      uid: 'user_' + Date.now(),
-      name: email.split('@')[0],
-      email: email.trim(),
-      mobile: '+91 9876543210',
-      role: 'customer',
-      status: 'active',
-      createdAt: new Date().toISOString()
-    };
-    setCurrentUser(newUser);
-    setCustomers(prev => [...prev, newUser]);
-    showToast(`Welcome, ${newUser.name}!`, 'success');
-    return true;
-  };
-
-  const loginWithDemo = (role: 'customer' | 'admin') => {
-    if (role === 'admin') {
-      const admin = customers.find(c => c.role === 'admin') || INITIAL_USERS[0];
       setCurrentUser(admin);
-      showToast('Logged in as Administrator (Demo Mode)', 'success');
+      showToast('Logged in as Administrator', 'success');
       navigate('admin', { adminTab: 'dashboard' });
     } else {
       const cust = customers.find(c => c.role === 'customer') || INITIAL_USERS[1];
@@ -330,28 +365,43 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
-  const register = async (name: string, email: string, mobile: string, _pass: string): Promise<boolean> => {
-    const existing = customers.find(c => c.email.toLowerCase() === email.trim().toLowerCase());
-    if (existing) {
-      showToast('Account with this email already exists. Please login.', 'error');
-      return false;
+  const register = async (
+    nameOrData: string | { name: string; email: string; mobile: string; password?: string },
+    email?: string,
+    mobile?: string,
+    pass?: string
+  ): Promise<UserProfile> => {
+    let finalName = '';
+    let finalEmail = '';
+    let finalMobile = '';
+    let finalPass = '';
+
+    if (typeof nameOrData === 'object') {
+      finalName = nameOrData.name;
+      finalEmail = nameOrData.email;
+      finalMobile = nameOrData.mobile;
+      finalPass = nameOrData.password || '';
+    } else {
+      finalName = nameOrData;
+      finalEmail = email || '';
+      finalMobile = mobile || '';
+      finalPass = pass || '';
     }
-    const newUser: UserProfile = {
-      uid: 'cust_' + Date.now(),
-      name: name.trim(),
-      email: email.trim(),
-      mobile: mobile.trim(),
-      role: email.toLowerCase().includes('admin') ? 'admin' : 'customer',
-      status: 'active',
-      createdAt: new Date().toISOString()
-    };
-    setCustomers(prev => [...prev, newUser]);
-    setCurrentUser(newUser);
-    showToast('Registration successful! Welcome to Reza Enterprise.', 'success');
-    return true;
+
+    try {
+      const userProfile = await firebaseSignUp(finalName, finalEmail, finalMobile, finalPass);
+      setCurrentUser(userProfile);
+      setCustomers(prev => [userProfile, ...prev]);
+      showToast('Registration successful! Welcome to Reza Enterprise.', 'success');
+      return userProfile;
+    } catch (err: any) {
+      showToast(err?.message || 'Registration failed', 'error');
+      throw err;
+    }
   };
 
-  const logout = () => {
+  const logout = async () => {
+    await firebaseSignOut();
     setCurrentUser(null);
     showToast('You have been logged out.', 'info');
     navigate('home');
@@ -373,7 +423,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       paymentStatus: 'Pending Verification'
     };
 
+    // Update local state immediately
     setOrders(prev => [newOrder, ...prev]);
+
+    // Save to Firebase Firestore
+    saveOrderToFirestore(newOrder);
 
     // Add in-app notifications
     const newNotif: AppNotification = {
@@ -398,21 +452,28 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     tracking?: string,
     adminNote?: string
   ) => {
+    const updates: Partial<OrderItem> = {
+      orderStatus: status,
+      ...(courier !== undefined ? { courierName: courier } : {}),
+      ...(tracking !== undefined ? { trackingNumber: tracking } : {}),
+      ...(adminNote !== undefined ? { adminNote } : {})
+    };
+
     setOrders(prev =>
       prev.map(o => {
         if (o.orderId === orderId) {
           return {
             ...o,
-            orderStatus: status,
-            courierName: courier !== undefined ? courier : o.courierName,
-            trackingNumber: tracking !== undefined ? tracking : o.trackingNumber,
-            adminNote: adminNote !== undefined ? adminNote : o.adminNote,
+            ...updates,
             updatedAt: new Date().toISOString()
           };
         }
         return o;
       })
     );
+
+    // Update in Firebase Firestore
+    updateOrderInFirestore(orderId, updates);
 
     // Create status notification
     setNotifications(prev => [
@@ -432,39 +493,54 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const updatePaymentStatus = (orderId: string, paymentStatus: PaymentStatus, transactionId?: string) => {
+    const newOrderStatus = paymentStatus === 'Verified' ? 'Payment Verified' : undefined;
+    const updates: Partial<OrderItem> = {
+      paymentStatus,
+      ...(transactionId ? { transactionId } : {}),
+      ...(newOrderStatus ? { orderStatus: newOrderStatus } : {})
+    };
+
     setOrders(prev =>
       prev.map(o => {
         if (o.orderId === orderId) {
-          const newOrderStatus = paymentStatus === 'Verified' ? 'Payment Verified' : o.orderStatus;
           return {
             ...o,
-            paymentStatus,
-            transactionId: transactionId || o.transactionId,
-            orderStatus: newOrderStatus,
+            ...updates,
             updatedAt: new Date().toISOString()
           };
         }
         return o;
       })
     );
+
+    // Update in Firebase Firestore
+    updateOrderInFirestore(orderId, updates);
+
     showToast(`Payment for #${orderId} marked as ${paymentStatus}`, 'success');
   };
 
   const submitUpiPayment = async (orderId: string, transactionId: string, screenshotUrl?: string): Promise<boolean> => {
+    const updates: Partial<OrderItem> = {
+      transactionId,
+      ...(screenshotUrl ? { paymentScreenshot: screenshotUrl } : {}),
+      paymentStatus: 'Pending Verification'
+    };
+
     setOrders(prev =>
       prev.map(o => {
         if (o.orderId === orderId) {
           return {
             ...o,
-            transactionId,
-            paymentScreenshot: screenshotUrl || o.paymentScreenshot,
-            paymentStatus: 'Pending Verification',
+            ...updates,
             updatedAt: new Date().toISOString()
           };
         }
         return o;
       })
     );
+
+    // Update in Firebase Firestore
+    updateOrderInFirestore(orderId, updates);
 
     setNotifications(prev => [
       {
@@ -485,6 +561,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const deleteOrder = (orderId: string) => {
     setOrders(prev => prev.filter(o => o.orderId !== orderId));
+    deleteOrderFromFirestore(orderId);
     showToast(`Order #${orderId} removed`, 'info');
   };
 
@@ -493,16 +570,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const id = serviceInput.name.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '-' + Date.now().toString().slice(-4);
     const newService: CardService = { ...serviceInput, id };
     setServices(prev => [newService, ...prev]);
+    saveServiceToFirestore(newService);
     showToast(`Service "${newService.name}" created`, 'success');
   };
 
   const updateService = (updated: CardService) => {
     setServices(prev => prev.map(s => (s.id === updated.id ? updated : s)));
+    saveServiceToFirestore(updated);
     showToast(`Service "${updated.name}" updated`, 'success');
   };
 
   const deleteService = (id: string) => {
     setServices(prev => prev.filter(s => s.id !== id));
+    deleteServiceFromFirestore(id);
     showToast('Service deleted', 'info');
   };
 
@@ -562,7 +642,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Settings
   const updateSettings = (newSettings: Partial<SiteSettings>) => {
-    setSettings(prev => ({ ...prev, ...newSettings }));
+    const updated = { ...settings, ...newSettings };
+    setSettings(updated);
+    saveSettingsToFirestore(updated);
     showToast('Website settings saved successfully', 'success');
   };
 
